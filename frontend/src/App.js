@@ -19,6 +19,7 @@ import EventDetailPage       from './pages/EventDetailPage';
 import UserDashboard         from './pages/UserDashboard';
 import OrganizerDashboard    from './pages/OrganizerDashboard';
 import AdminDashboard        from './pages/AdminDashboard';
+import ProfilePage           from './pages/ProfilePage';
 
 // ========================
 //  Protected Route Helper
@@ -51,6 +52,9 @@ function AppRoutes() {
           <ProtectedRoute allowedRole="admin"><AdminDashboard /></ProtectedRoute>
         } />
 
+        <Route path="/profile" element={
+          <ProtectedRoute><ProfilePage /></ProtectedRoute>
+        } />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </>

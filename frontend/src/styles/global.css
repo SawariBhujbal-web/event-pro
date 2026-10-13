@@ -861,3 +861,82 @@ tbody tr:last-child td { border-bottom: none; }
   .search-box { margin-left: 0; }
   .search-box input { width: 100%; }
 }
+
+
+.profile-card {
+  max-width: 700px;
+  margin: 40px auto;
+  padding: 28px;
+  border: 1px solid #3d3d3d;
+  border-radius: 16px;
+  background: #1c1c1c;
+  color: #ffffff;
+}
+
+.profile-header {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 28px;
+}
+
+.profile-header h1 {
+  margin: 0 0 6px;
+}
+
+.profile-header p {
+  margin: 0;
+  color: #b8b8b8;
+}
+
+.profile-avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: #e5a51a;
+  color: #181818;
+  font-size: 28px;
+  font-weight: bold;
+}
+
+.profile-details {
+  display: grid;
+  gap: 0;
+}
+
+.profile-field {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 0;
+  border-top: 1px solid #3d3d3d;
+}
+
+.profile-field span {
+  color: #b8b8b8;
+}
+
+.profile-field strong {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .profile-card {
+    margin: 20px 12px;
+    padding: 20px;
+  }
+
+  .profile-field {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .profile-field strong {
+    text-align: left;
+  }
+}
+

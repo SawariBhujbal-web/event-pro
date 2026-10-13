@@ -13,7 +13,8 @@ import os
 from functools import wraps
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 app = Flask(__name__)
 CORS(app)
@@ -26,7 +27,12 @@ app.config['MYSQL_USER']     = os.getenv('MYSQL_USER', 'root')
 app.config['MYSQL_PASSWORD'] = os.getenv('MYSQL_PASSWORD', '')
 app.config['MYSQL_DB']       = os.getenv('MYSQL_DB', 'eventpro')
 
-JWT_SECRET = os.getenv('JWT_SECRET_KEY', 'eventpro-secret-key')
+JWT_SECRET = os.getenv('JWT_SECRET_KEY')
+
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET_KEY is missing. Check the backend/.env configuration."
+    )
 
 mysql = MySQL(app)
 
@@ -178,6 +184,279 @@ def login():
 
     token = create_token(row_dict['id'], role)
     return jsonify({'token': token, 'user': row_dict, 'role': role}), 200
+
+
+# ---------- GET MY PROFILE ----------
+@app.route('/api/profile', methods=['GET'])
+@token_required
+def get_profile():
+    # Select the correct account table using the verified JWT role.
+    profile_map = {
+        'user': (
+            'users',
+            ['id', 'name', 'email', 'phone', 'created_at']
+        ),
+        'organizer': (
+            'organizers',
+            ['id', 'name', 'email', 'organization', 'phone', 'created_at']
+        ),
+        'admin': (
+            'admins',
+            ['id', 'name', 'email', 'created_at']
+        )
+    }
+
+    if request.role not in profile_map:
+        return jsonify({'error': 'Invalid account role'}), 403
+
+    table, columns = profile_map[request.role]
+    cur = get_cursor()
+
+    try:
+        cur.execute(
+            f"SELECT {', '.join(columns)} FROM {table} WHERE id = %s",
+            (request.user_id,)
+        )
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Profile not found'}), 404
+
+        profile = dict(zip(columns, row))
+
+        return jsonify({
+            'profile': profile,
+            'role': request.role
+        }), 200
+
+    finally:
+        cur.close()
+
+
+# ---------- UPDATE MY PROFILE ----------
+@app.route('/api/profile', methods=['PUT'])
+@token_required
+def update_profile():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({'error': 'A valid JSON object is required'}), 400
+
+    # The table and editable columns are controlled by the backend.
+    profile_map = {
+        'user': {
+            'table': 'users',
+            'fields': {'name', 'phone'}
+        },
+        'organizer': {
+            'table': 'organizers',
+            'fields': {'name', 'organization', 'phone'}
+        },
+        'admin': {
+            'table': 'admins',
+            'fields': {'name'}
+        }
+    }
+
+    role = request.role
+
+    if role not in profile_map:
+        return jsonify({'error': 'Invalid account role'}), 403
+
+    config = profile_map[role]
+    table = config['table']
+    allowed_fields = config['fields']
+
+    # Reject fields this role is not permitted to edit.
+    if set(data.keys()) - allowed_fields:
+        return jsonify({
+            'error': 'One or more fields cannot be edited for this account'
+        }), 400
+
+    # A name is required for every account.
+    name = data.get('name')
+
+    if not isinstance(name, str):
+        return jsonify({'error': 'Name is required'}), 400
+
+    name = name.strip()
+
+    if not name:
+        return jsonify({'error': 'Name cannot be empty'}), 400
+
+    if len(name) > 100:
+        return jsonify({'error': 'Name must be 100 characters or fewer'}), 400
+
+    updates = {'name': name}
+
+    # Validate phone only for roles that can edit it.
+    if 'phone' in allowed_fields and 'phone' in data:
+        phone = data['phone']
+
+        if not isinstance(phone, str):
+            return jsonify({'error': 'Phone must be text'}), 400
+
+        phone = phone.strip()
+
+        if phone:
+            permitted_characters = set('0123456789+()- ')
+            digit_count = sum(character.isdigit() for character in phone)
+
+            if (
+                any(character not in permitted_characters for character in phone)
+                or digit_count < 7
+                or digit_count > 15
+            ):
+                return jsonify({
+                    'error': 'Enter a valid phone number with 7 to 15 digits'
+                }), 400
+
+        updates['phone'] = phone
+
+    # Validate organization for organizers.
+    if role == 'organizer' and 'organization' in data:
+        organization = data['organization']
+
+        if not isinstance(organization, str):
+            return jsonify({'error': 'Organization must be text'}), 400
+
+        organization = organization.strip()
+
+        if len(organization) > 150:
+            return jsonify({
+                'error': 'Organization must be 150 characters or fewer'
+            }), 400
+
+        updates['organization'] = organization or None
+
+    cur = get_cursor()
+
+    try:
+        # The account ID comes from the verified JWT, never from the request.
+        cur.execute(
+            f"SELECT id FROM {table} WHERE id = %s",
+            (request.user_id,)
+        )
+
+        if not cur.fetchone():
+            return jsonify({'error': 'Profile not found'}), 404
+
+        # Column names come only from the server-controlled allowlist above.
+        set_clause = ', '.join(
+            f"{field} = %s" for field in updates
+        )
+        values = list(updates.values())
+        values.append(request.user_id)
+
+        cur.execute(
+            f"UPDATE {table} SET {set_clause} WHERE id = %s",
+            tuple(values)
+        )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            'message': 'Profile updated successfully'
+        }), 200
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception('Profile update failed')
+        return jsonify({
+            'error': 'Unable to update profile. Please try again.'
+        }), 500
+
+    finally:
+        cur.close()
+    
+# ---------- CHANGE PASSWORD ----------
+@app.route('/api/change-password', methods=['PUT'])
+@token_required
+def change_password():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({'error': 'A valid JSON object is required'}), 400
+
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+
+    if not isinstance(current_password, str) or not current_password:
+        return jsonify({'error': 'Current password is required'}), 400
+
+    if not isinstance(new_password, str):
+        return jsonify({'error': 'New password is required'}), 400
+
+    if len(new_password) < 8:
+        return jsonify({
+            'error': 'New password must be at least 8 characters long'
+        }), 400
+
+    if len(new_password) > 72:
+        return jsonify({
+            'error': 'New password must be 72 characters or fewer'
+        }), 400
+
+    if new_password == current_password:
+        return jsonify({
+            'error': 'New password must differ from the current password'
+        }), 400
+
+    password_tables = {
+        'user': 'users',
+        'organizer': 'organizers',
+        'admin': 'admins'
+    }
+
+    role = request.role
+
+    if role not in password_tables:
+        return jsonify({'error': 'Invalid account role'}), 403
+
+    table = password_tables[role]
+    cur = get_cursor()
+
+    try:
+        # Use the authenticated account ID, not an ID supplied by the client.
+        cur.execute(
+            f"SELECT password FROM {table} WHERE id = %s",
+            (request.user_id,)
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Account not found'}), 404
+
+        stored_password = row[0]
+
+        if not check_password(current_password, stored_password):
+            return jsonify({'error': 'Current password is incorrect'}), 400
+
+        hashed_password = hash_password(new_password)
+
+        cur.execute(
+            f"UPDATE {table} SET password = %s WHERE id = %s",
+            (hashed_password, request.user_id)
+        )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            'message': 'Password changed successfully'
+        }), 200
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception('Password change failed')
+        return jsonify({
+            'error': 'Unable to change password. Please try again.'
+        }), 500
+
+    finally:
+        cur.close()
+
+
 
 
 # ============================================================
