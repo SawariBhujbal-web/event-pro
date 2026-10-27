@@ -10,6 +10,9 @@ import bcrypt
 import jwt
 import datetime
 import os
+import secrets
+import hashlib
+from flask_mail import Mail, Message
 from functools import wraps
 from dotenv import load_dotenv
 
@@ -36,6 +39,17 @@ if not JWT_SECRET:
 
 mysql = MySQL(app)
 
+# ========================
+# PASSWORD RESET EMAIL
+# ========================
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = os.getenv('MAIL_USERNAME')
+
+mail = Mail(app)
 
 # ============================================================
 #  HELPER FUNCTIONS
@@ -368,7 +382,176 @@ def update_profile():
 
     finally:
         cur.close()
-    
+
+
+ # ---------- REQUEST PASSWORD RESET ----------
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    role = data.get('role', 'user')
+
+    if not email or role not in ('user', 'organizer', 'admin'):
+        return jsonify({
+            'message': 'If an account matches those details, a reset link will be sent.'
+        }), 200
+
+    table_map = {
+        'user': 'users',
+        'organizer': 'organizers',
+        'admin': 'admins'
+    }
+
+    cur = get_cursor()
+
+    try:
+        cur.execute(
+            f"SELECT id FROM {table_map[role]} WHERE email = %s",
+            (email,)
+        )
+        account = cur.fetchone()
+
+        # Always return the same response, whether the account exists or not.
+        if account:
+            raw_token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            expires_at = datetime.utcnow() + timedelta(minutes=30)
+
+            cur.execute("""
+                UPDATE password_reset_tokens
+                SET used_at = UTC_TIMESTAMP()
+                WHERE email = %s AND role = %s AND used_at IS NULL
+            """, (email, role))
+
+            cur.execute("""
+                INSERT INTO password_reset_tokens
+                    (email, role, token_hash, expires_at)
+                VALUES (%s, %s, %s, %s)
+            """, (email, role, token_hash, expires_at))
+
+            mysql.connection.commit()
+
+            reset_url = (
+                os.getenv('FRONTEND_URL', 'http://localhost:3000')
+                + '/reset-password?token=' + raw_token
+                + '&role=' + role
+            )
+
+            message = Message(
+                subject='Reset your EventPro password',
+                recipients=[email],
+                body=(
+                    'We received a request to reset your EventPro password.\n\n'
+                    f'Open this link within 30 minutes:\n{reset_url}\n\n'
+                    'If you did not request this, you can ignore this email.'
+                )
+            )
+            mail.send(message)
+
+        return jsonify({
+            'message': 'If an account matches those details, a reset link will be sent.'
+        }), 200
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception('Password reset request failed')
+        return jsonify({
+            'error': 'Unable to process the request right now. Please try again later.'
+        }), 500
+
+    finally:
+        cur.close()
+
+
+# ---------- RESET PASSWORD ----------
+@app.route('/api/reset-password', methods=['POST'])
+def reset_password():
+    data = request.get_json(silent=True) or {}
+
+    raw_token = data.get('token', '')
+    role = data.get('role', '')
+    new_password = data.get('new_password', '')
+
+    if not isinstance(raw_token, str) or not raw_token:
+        return jsonify({'error': 'Reset token is required.'}), 400
+
+    if role not in ('user', 'organizer', 'admin'):
+        return jsonify({'error': 'Invalid reset request.'}), 400
+
+    if not isinstance(new_password, str) or len(new_password) < 8:
+        return jsonify({
+            'error': 'Password must be at least 8 characters long.'
+        }), 400
+
+    if len(new_password) > 72:
+        return jsonify({
+            'error': 'Password must be 72 characters or fewer.'
+        }), 400
+
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+    table_map = {
+        'user': 'users',
+        'organizer': 'organizers',
+        'admin': 'admins'
+    }
+
+    cur = get_cursor()
+
+    try:
+        cur.execute("""
+            SELECT id, email
+            FROM password_reset_tokens
+            WHERE token_hash = %s
+              AND role = %s
+              AND used_at IS NULL
+              AND expires_at > UTC_TIMESTAMP()
+            LIMIT 1
+        """, (token_hash, role))
+
+        reset_record = cur.fetchone()
+
+        if not reset_record:
+            return jsonify({
+                'error': 'This reset link is invalid, expired, or already used.'
+            }), 400
+
+        reset_id, email = reset_record
+        hashed_password = hash_password(new_password)
+
+        cur.execute(
+            f"UPDATE {table_map[role]} SET password = %s WHERE email = %s",
+            (hashed_password, email)
+        )
+
+        if cur.rowcount != 1:
+            mysql.connection.rollback()
+            return jsonify({'error': 'Unable to reset this account password.'}), 400
+
+        cur.execute("""
+            UPDATE password_reset_tokens
+            SET used_at = UTC_TIMESTAMP()
+            WHERE id = %s AND used_at IS NULL
+        """, (reset_id,))
+
+        mysql.connection.commit()
+
+        return jsonify({
+            'message': 'Password reset successfully. You can now log in.'
+        }), 200
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception('Password reset failed')
+        return jsonify({
+            'error': 'Unable to reset the password right now.'
+        }), 500
+
+    finally:
+        cur.close()
+
+        
+           
 # ---------- CHANGE PASSWORD ----------
 @app.route('/api/change-password', methods=['PUT'])
 @token_required
@@ -532,10 +715,29 @@ def get_event(event_id):
         event['event_date'] = str(event['event_date'])
     if event.get('event_time'):
         event['event_time'] = str(event['event_time'])
+    
     if event.get('created_at'):
         event['created_at'] = str(event['created_at'])
+
+    # Fetch ticket categories for this event
+    cur.execute("""
+        SELECT id, name, price, total_quantity, available_quantity
+        FROM ticket_categories
+        WHERE event_id = %s
+        ORDER BY price ASC, id ASC
+    """, (event_id,))
+
+    category_rows = cur.fetchall()
+    category_columns = [column[0] for column in cur.description]
+
+    event['ticket_categories'] = [
+        dict(zip(category_columns, row))
+        for row in category_rows
+    ]
+
     cur.close()
     return jsonify(event), 200
+
 
 
 # ---------- CREATE EVENT (Organizer only) ----------
